@@ -710,6 +710,87 @@ void TextEditor::HandleKeyboardInputs()
 		io.WantCaptureKeyboard = true;
 		io.WantTextInput = true;
 
+		// Ctrl+Space: trigger autocomplete (consume to prevent space insertion)
+		if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Space))
+		{
+			if (mAutocompleteProvider)
+			{
+				auto pos = GetCursorPosition();
+				auto word = GetWordAtCursor();
+				mAutocompleteProvider->RequestCompletions(mFilePath, pos.mLine, pos.mColumn, word);
+			}
+			// Clear input queue so the space character doesn't get inserted
+			io.InputQueueCharacters.resize(0);
+			goto skip_keys;
+		}
+
+		// Autocomplete navigation intercepts keys before normal handling
+		if (mShowCompletions && !mFilteredCompletions.empty())
+		{
+			bool consumed = false;
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+			{
+				mCompletionSelected = std::min(mCompletionSelected + 1, (int)mFilteredCompletions.size() - 1);
+				consumed = true;
+			}
+			else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+			{
+				mCompletionSelected = std::max(mCompletionSelected - 1, 0);
+				consumed = true;
+			}
+			else if (ImGui::IsKeyPressed(ImGuiKey_Tab) || ImGui::IsKeyPressed(ImGuiKey_Enter))
+			{
+				if (mCompletionSelected >= 0 && mCompletionSelected < (int)mFilteredCompletions.size())
+				{
+					int idx = mFilteredCompletions[mCompletionSelected];
+					auto& insertText = mCompletionItems[idx].insertText;
+
+					// Build undo record: remove prefix, add completion
+					UndoRecord u;
+					u.mBefore = mState;
+
+					auto cursorPos = GetActualCursorCoordinates();
+					// Compute prefix start position
+					Coordinates prefixStart = cursorPos;
+					prefixStart.mColumn -= (int)mCompletionPrefix.size();
+					if (prefixStart.mColumn < 0) prefixStart.mColumn = 0;
+
+					// Remove prefix
+					u.mRemoved = mCompletionPrefix;
+					u.mRemovedStart = prefixStart;
+					u.mRemovedEnd = cursorPos;
+
+					// Delete the prefix from the buffer
+					SetSelection(prefixStart, cursorPos);
+					DeleteSelection();
+
+					// Insert completion text
+					auto insertStart = GetActualCursorCoordinates();
+					auto insertEnd = insertStart;
+					InsertTextAt(insertEnd, insertText.c_str());
+					SetCursorPosition(insertEnd);
+
+					u.mAdded = insertText;
+					u.mAddedStart = insertStart;
+					u.mAddedEnd = insertEnd;
+					u.mAfter = mState;
+					AddUndo(u);
+				}
+				mShowCompletions = false;
+				mCompletionItems.clear();
+				consumed = true;
+			}
+			// Note: Escape is handled by ImGui's nav (unfocuses window),
+			// which triggers the focus-loss dismissal below.
+			if (consumed)
+			{
+				// Clear the key states so ImGui's child window doesn't scroll
+				ImGuiIO& cio = ImGui::GetIO();
+				cio.ClearInputKeys();
+				goto skip_keys;
+			}
+		}
+
 		if (!IsReadOnly() && ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Z))
 			Undo();
 		else if (!IsReadOnly() && !ctrl && !shift && alt && ImGui::IsKeyPressed(ImGuiKey_Backspace))
@@ -770,6 +851,20 @@ void TextEditor::HandleKeyboardInputs()
 					EnterCharacter(c, shift);
 			}
 			io.InputQueueCharacters.resize(0);
+		}
+
+		// Trigger autocomplete after typing
+		UpdateAutocomplete();
+
+		skip_keys:;
+	}
+	else
+	{
+		// Window lost focus - dismiss completions
+		if (mShowCompletions)
+		{
+			mShowCompletions = false;
+			mCompletionItems.clear();
 		}
 	}
 }
@@ -1001,6 +1096,7 @@ void TextEditor::Render()
 						}
 						ImVec2 cstart(textScreenPos.x + cx, lineStartScreenPos.y);
 						ImVec2 cend(textScreenPos.x + cx + width, lineStartScreenPos.y + mCharAdvance.y);
+						mCursorScreenPos = ImVec2(cstart.x, cend.y);
 						drawList->AddRectFilled(cstart, cend, mPalette[(int)PaletteIndex::Cursor]);
 						if (elapsed > 800)
 							mStartTime = timeEnd;
@@ -1148,6 +1244,9 @@ void TextEditor::Render(const char* aTitle, const ImVec2& aSize, bool aBorder)
 
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
+
+	// Render autocomplete popup (after EndChild so it's a top-level window)
+	RenderAutocompletePopup();
 
 	mWithinRender = false;
 }
@@ -3156,4 +3255,237 @@ const TextEditor::LanguageDefinition& TextEditor::LanguageDefinition::Lua()
 		inited = true;
 	}
 	return langDef;
+}
+
+std::string TextEditor::GetWordAtCursor() const
+{
+	auto pos = GetCursorPosition();
+	if (pos.mLine >= (int)mLines.size())
+		return "";
+	auto& line = mLines[pos.mLine];
+	int end = GetCharacterIndex(pos);
+	int start = end;
+	while (start > 0)
+	{
+		auto c = line[start - 1].mChar;
+		if (!isalnum(c) && c != '_')
+			break;
+		start--;
+	}
+	std::string word;
+	for (int i = start; i < end; i++)
+		word += line[i].mChar;
+	return word;
+}
+
+void TextEditor::UpdateAutocomplete()
+{
+	if (!mAutocompleteProvider)
+		return;
+
+	// Check if provider has new results
+	if (mAutocompleteProvider->HasResults())
+	{
+		mCompletionItems.clear();
+		auto results = mAutocompleteProvider->TakeResults();
+		for (auto& r : results)
+			mCompletionItems.push_back({r.label, r.detail, r.insertText, r.kind});
+		mCompletionSelected = 0;
+		mShowCompletions = !mCompletionItems.empty();
+	}
+
+	// Filter by current prefix
+	if (mShowCompletions)
+	{
+		mCompletionPrefix = GetWordAtCursor();
+		mFilteredCompletions.clear();
+		for (int i = 0; i < (int)mCompletionItems.size(); i++)
+		{
+			auto& label = mCompletionItems[i].label;
+			if (mCompletionPrefix.empty())
+			{
+				mFilteredCompletions.push_back(i);
+				continue;
+			}
+			if (label.size() >= mCompletionPrefix.size())
+			{
+				bool match = true;
+				for (size_t j = 0; j < mCompletionPrefix.size(); j++)
+				{
+					if (tolower(label[j]) != tolower(mCompletionPrefix[j]))
+					{
+						match = false;
+						break;
+					}
+				}
+				if (match)
+					mFilteredCompletions.push_back(i);
+			}
+		}
+		if (mFilteredCompletions.empty())
+			mShowCompletions = false;
+		mCompletionSelected = std::clamp(mCompletionSelected, 0,
+			std::max(0, (int)mFilteredCompletions.size() - 1));
+	}
+
+	// Auto-request completions only when text was actually changed (typing)
+	if (mTextChanged && !mShowCompletions)
+	{
+		auto pos = GetCursorPosition();
+		if (pos.mLine < (int)mLines.size() && pos.mColumn > 0)
+		{
+			int cindex = GetCharacterIndex(pos);
+			if (cindex > 0)
+			{
+				auto c = mLines[pos.mLine][cindex - 1].mChar;
+				if (isalnum(c) || c == '.' || c == '_')
+				{
+					auto word = GetWordAtCursor();
+					mAutocompleteProvider->RequestCompletions(mFilePath, pos.mLine, pos.mColumn, word);
+				}
+			}
+		}
+		mAutocompleteProvider->OnTextChanged(mFilePath, GetText());
+	}
+
+	// Dismiss completions when cursor moves without typing
+	if (!mTextChanged && mCursorPositionChanged && mShowCompletions)
+	{
+		mShowCompletions = false;
+		mCompletionItems.clear();
+	}
+}
+
+static const char* CompletionKindIcon(TextEditor::CompletionKind kind)
+{
+	switch (kind)
+	{
+		case TextEditor::CompletionKind::Method:
+		case TextEditor::CompletionKind::Function:
+		case TextEditor::CompletionKind::Constructor:  return "fn";
+		case TextEditor::CompletionKind::Field:        return "fd";
+		case TextEditor::CompletionKind::Variable:     return "vr";
+		case TextEditor::CompletionKind::Class:        return "cl";
+		case TextEditor::CompletionKind::Interface:    return "if";
+		case TextEditor::CompletionKind::Module:       return "md";
+		case TextEditor::CompletionKind::Property:     return "pr";
+		case TextEditor::CompletionKind::Enum:         return "en";
+		case TextEditor::CompletionKind::Keyword:      return "kw";
+		case TextEditor::CompletionKind::Snippet:      return "sn";
+		case TextEditor::CompletionKind::Struct:       return "st";
+		case TextEditor::CompletionKind::Event:        return "ev";
+		case TextEditor::CompletionKind::Constant:     return "cn";
+		case TextEditor::CompletionKind::EnumMember:   return "em";
+		case TextEditor::CompletionKind::TypeParameter: return "tp";
+		default:                                        return "  ";
+	}
+}
+
+static ImVec4 CompletionKindColor(TextEditor::CompletionKind kind)
+{
+	switch (kind)
+	{
+		case TextEditor::CompletionKind::Method:
+		case TextEditor::CompletionKind::Function:
+		case TextEditor::CompletionKind::Constructor:  return ImVec4(0.8f, 0.6f, 1.0f, 1.0f);
+		case TextEditor::CompletionKind::Field:
+		case TextEditor::CompletionKind::Variable:     return ImVec4(0.5f, 0.8f, 1.0f, 1.0f);
+		case TextEditor::CompletionKind::Class:
+		case TextEditor::CompletionKind::Struct:
+		case TextEditor::CompletionKind::Interface:    return ImVec4(0.3f, 0.9f, 0.6f, 1.0f);
+		case TextEditor::CompletionKind::Property:     return ImVec4(0.9f, 0.7f, 0.4f, 1.0f);
+		case TextEditor::CompletionKind::Enum:
+		case TextEditor::CompletionKind::EnumMember:   return ImVec4(0.9f, 0.8f, 0.3f, 1.0f);
+		case TextEditor::CompletionKind::Keyword:      return ImVec4(0.6f, 0.6f, 0.9f, 1.0f);
+		case TextEditor::CompletionKind::Event:        return ImVec4(0.9f, 0.5f, 0.5f, 1.0f);
+		default:                                        return ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+	}
+}
+
+void TextEditor::RenderAutocompletePopup()
+{
+	if (!mShowCompletions || mFilteredCompletions.empty())
+		return;
+
+	int visible_count = std::min((int)mFilteredCompletions.size(), 10);
+	float item_height = ImGui::GetTextLineHeightWithSpacing();
+
+	ImGui::SetNextWindowPos(mCursorScreenPos);
+	ImGui::SetNextWindowSize(ImVec2(450, visible_count * item_height + 8));
+	ImGui::SetNextWindowBgAlpha(0.95f);
+	ImGui::Begin("##TextEditorCompletions", nullptr,
+		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoFocusOnAppearing |
+		ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+		ImGuiWindowFlags_Tooltip);
+
+	ImDrawList* draw_list = ImGui::GetWindowDrawList();
+	for (int vi = 0; vi < visible_count; vi++)
+	{
+		int idx = mFilteredCompletions[vi];
+		auto& item = mCompletionItems[idx];
+		bool is_selected = (vi == mCompletionSelected);
+
+		ImGui::PushID(vi);
+
+		// Draw kind icon in the left margin
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImVec4 kind_color = CompletionKindColor(item.kind);
+		const char* icon = CompletionKindIcon(item.kind);
+
+		// Build display: "  label   detail"
+		std::string display = "   ";
+		display += item.label;
+
+		if (ImGui::Selectable(display.c_str(), is_selected))
+		{
+			UndoRecord u;
+			u.mBefore = mState;
+
+			auto cursorPos = GetActualCursorCoordinates();
+			Coordinates prefixStart = cursorPos;
+			prefixStart.mColumn -= (int)mCompletionPrefix.size();
+			if (prefixStart.mColumn < 0) prefixStart.mColumn = 0;
+
+			u.mRemoved = mCompletionPrefix;
+			u.mRemovedStart = prefixStart;
+			u.mRemovedEnd = cursorPos;
+
+			SetSelection(prefixStart, cursorPos);
+			DeleteSelection();
+
+			auto insertStart = GetActualCursorCoordinates();
+			auto insertEnd = insertStart;
+			InsertTextAt(insertEnd, item.insertText.c_str());
+			SetCursorPosition(insertEnd);
+
+			u.mAdded = item.insertText;
+			u.mAddedStart = insertStart;
+			u.mAddedEnd = insertEnd;
+			u.mAfter = mState;
+			AddUndo(u);
+
+			mShowCompletions = false;
+			mCompletionItems.clear();
+			ImGui::PopID();
+			break;
+		}
+
+		// Draw the kind icon over the left margin area
+		draw_list->AddText(ImVec2(pos.x + 2, pos.y),
+			ImGui::ColorConvertFloat4ToU32(kind_color), icon);
+
+		// Draw detail right-aligned
+		if (!item.detail.empty())
+		{
+			float detail_width = ImGui::CalcTextSize(item.detail.c_str()).x;
+			draw_list->AddText(
+				ImVec2(pos.x + ImGui::GetWindowWidth() - detail_width - 10, pos.y),
+				IM_COL32(150, 150, 150, 200), item.detail.c_str());
+		}
+
+		ImGui::PopID();
+	}
+
+	ImGui::End();
 }

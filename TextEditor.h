@@ -182,6 +182,35 @@ public:
 		static const LanguageDefinition& Lua();
 	};
 
+	// Autocomplete provider interface
+	enum class CompletionKind {
+		Text = 1, Method, Function, Constructor, Field, Variable,
+		Class, Interface, Module, Property, Unit, Value, Enum,
+		Keyword, Snippet, Color, File, Reference, Folder,
+		EnumMember, Constant, Struct, Event, Operator, TypeParameter,
+	};
+
+	struct CompletionItem {
+		std::string label;
+		std::string detail;
+		std::string insertText;
+		CompletionKind kind = CompletionKind::Text;
+	};
+
+	class IAutocompleteProvider {
+	public:
+		virtual ~IAutocompleteProvider() = default;
+		// Called when the user types a trigger character. The provider should
+		// populate results asynchronously and return them via GetResults().
+		virtual void RequestCompletions(const std::string& filePath, int line, int column, const std::string& prefix) = 0;
+		// Called when text changes. The provider can use this for incremental sync.
+		virtual void OnTextChanged(const std::string& filePath, const std::string& fullText) {}
+		// Returns true if new results are available since the last call.
+		virtual bool HasResults() = 0;
+		// Takes the results (clears the internal buffer).
+		virtual std::vector<CompletionItem> TakeResults() = 0;
+	};
+
 	TextEditor();
 	~TextEditor();
 
@@ -211,6 +240,13 @@ public:
 	bool IsReadOnly() const { return mReadOnly; }
 	bool IsTextChanged() const { return mTextChanged; }
 	bool IsCursorPositionChanged() const { return mCursorPositionChanged; }
+
+	// Returns the cursor position in screen coordinates (valid after Render)
+	ImVec2 GetCursorScreenPosition() const { return mCursorScreenPos; }
+
+	// Autocomplete
+	void SetAutocompleteProvider(IAutocompleteProvider* provider) { mAutocompleteProvider = provider; }
+	void SetFilePath(const std::string& path) { mFilePath = path; }
 
 	bool IsColorizerEnabled() const { return mColorizerEnabled; }
 	void SetColorizerEnable(bool aValue);
@@ -381,7 +417,21 @@ private:
 	Breakpoints mBreakpoints;
 	ErrorMarkers mErrorMarkers;
 	ImVec2 mCharAdvance;
+	ImVec2 mCursorScreenPos;
 	Coordinates mInteractiveStart, mInteractiveEnd;
+
+	// Autocomplete state
+	IAutocompleteProvider* mAutocompleteProvider = nullptr;
+	std::string mFilePath;
+	std::vector<CompletionItem> mCompletionItems;
+	std::vector<int> mFilteredCompletions;
+	int mCompletionSelected = 0;
+	bool mShowCompletions = false;
+	std::string mCompletionPrefix;
+
+	void UpdateAutocomplete();
+	void RenderAutocompletePopup();
+	std::string GetWordAtCursor() const;
 	std::string mLineBuffer;
 	uint64_t mStartTime;
 
