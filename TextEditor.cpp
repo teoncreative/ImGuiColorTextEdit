@@ -3287,9 +3287,11 @@ void TextEditor::UpdateAutocomplete()
 	if (mAutocompleteProvider->HasResults())
 	{
 		mCompletionItems.clear();
-		auto results = mAutocompleteProvider->TakeResults();
-		for (auto& r : results)
+		std::vector<CompletionItem> results = mAutocompleteProvider->TakeResults();
+		for (CompletionItem& r : results)
+		{
 			mCompletionItems.push_back({r.label, r.detail, r.insertText, r.kind});
+		}
 		mCompletionSelected = 0;
 		mShowCompletions = !mCompletionItems.empty();
 	}

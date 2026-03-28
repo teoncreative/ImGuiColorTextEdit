@@ -248,6 +248,20 @@ public:
 	void SetAutocompleteProvider(IAutocompleteProvider* provider) { mAutocompleteProvider = provider; }
 	void SetFilePath(const std::string& path) { mFilePath = path; }
 
+	// Add a known identifier for syntax highlighting (e.g. from LSP)
+	void AddIdentifier(const std::string& name, const std::string& declaration = "") {
+		Identifier id;
+		id.mDeclaration = declaration;
+		mLanguageDefinition.mIdentifiers[name] = id;
+	}
+
+	// Call after adding identifiers to refresh highlighting
+	void InvalidateColorize() {
+		mColorRangeMin = 0;
+		mColorRangeMax = (int)mLines.size();
+		mCheckComments = true;
+	}
+
 	bool IsColorizerEnabled() const { return mColorizerEnabled; }
 	void SetColorizerEnable(bool aValue);
 
