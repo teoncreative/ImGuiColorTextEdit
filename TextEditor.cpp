@@ -322,12 +322,16 @@ void TextEditor::AddUndo(UndoRecord& aValue)
 
 TextEditor::Coordinates TextEditor::ScreenPosToCoordinates(const ImVec2& aPosition) const
 {
-	ImVec2 origin = ImGui::GetCursorScreenPos();
-	ImVec2 local(aPosition.x - origin.x, aPosition.y - origin.y);
+  return ScreenPosToCoordinates(aPosition, ImGui::GetCursorScreenPos());
+}
 
-	int lineNo = std::max(0, (int)floor(local.y / mCharAdvance.y));
+TextEditor::Coordinates TextEditor::ScreenPosToCoordinates(
+    const ImVec2& aPosition, const ImVec2& origin) const {
+  ImVec2 local(aPosition.x - origin.x, aPosition.y - origin.y);
 
-	int columnCoord = 0;
+  int lineNo = std::max(0, (int)floor(local.y / mCharAdvance.y));
+
+  int columnCoord = 0;
 
 	if (lineNo >= 0 && lineNo < (int)mLines.size())
 	{
@@ -694,6 +698,190 @@ ImU32 TextEditor::GetGlyphColor(const Glyph & aGlyph) const
 	return color;
 }
 
+// Render a single line of code with syntax highlighting
+void TextEditor::RenderCodeLine(const char* first, const char* last) {
+  while (first < last) {
+    const char* token_begin = nullptr;
+    const char* token_end = nullptr;
+    PaletteIndex token_color = PaletteIndex::Default;
+    bool found = false;
+
+    if (mLanguageDefinition.mTokenize != nullptr) {
+      if (mLanguageDefinition.mTokenize(first, last, token_begin, token_end,
+                                        token_color)) {
+        found = true;
+      }
+    }
+
+    if (!found) {
+      for (auto& p : mRegexList) {
+        std::smatch results;
+        std::string remaining(first, last);
+        if (std::regex_search(remaining, results, p.first,
+                              std::regex_constants::match_continuous)) {
+          found = true;
+          token_begin = first;
+          token_end = first + results[0].length();
+          token_color = p.second;
+          break;
+        }
+      }
+    }
+
+    if (!found || token_end <= token_begin) {
+      ImGui::TextUnformatted(first, first + 1);
+      ImGui::SameLine(0, 0);
+      ++first;
+    } else {
+      if (token_color == PaletteIndex::Identifier) {
+        std::string id(token_begin, token_end);
+        if (mLanguageDefinition.mKeywords.count(id) != 0) {
+          token_color = PaletteIndex::Keyword;
+        } else if (mLanguageDefinition.mIdentifiers.count(id) != 0) {
+          token_color = PaletteIndex::KnownIdentifier;
+        }
+      }
+
+      ImVec4 color = ImGui::ColorConvertU32ToFloat4(mPalette[(int)token_color]);
+      ImGui::PushStyleColor(ImGuiCol_Text, color);
+      ImGui::TextUnformatted(token_begin, token_end);
+      ImGui::PopStyleColor();
+      ImGui::SameLine(0, 0);
+      first = token_end;
+    }
+  }
+  ImGui::NewLine();
+}
+
+void TextEditor::RenderMarkdown(const std::string& text, ImFont* mono_font,
+                                float max_width) {
+  if (text.empty()) {
+    return;
+  }
+
+  // Split into segments: code blocks (``` ... ```) and plain text
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t fence_start = text.find("```", pos);
+    if (fence_start == std::string::npos) {
+      // Remaining text is plain
+      std::string plain = text.substr(pos);
+      auto is_ws = [](char c) {
+        return c == '\n' || c == '\r' || c == ' ' || c == '\t';
+      };
+      while (!plain.empty() && is_ws(plain.front())) {
+        plain.erase(0, 1);
+      }
+      while (!plain.empty() && is_ws(plain.back())) {
+        plain.pop_back();
+      }
+      if (!plain.empty()) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + max_width);
+        ImGui::TextUnformatted(plain.c_str());
+        ImGui::PopTextWrapPos();
+      }
+      break;
+    }
+
+    // Render plain text before the code fence
+    if (fence_start > pos) {
+      std::string plain = text.substr(pos, fence_start - pos);
+      // Trim all surrounding whitespace
+      auto is_ws = [](char c) {
+        return c == '\n' || c == '\r' || c == ' ' || c == '\t';
+      };
+      while (!plain.empty() && is_ws(plain.front())) {
+        plain.erase(0, 1);
+      }
+      while (!plain.empty() && is_ws(plain.back())) {
+        plain.pop_back();
+      }
+      if (!plain.empty()) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + max_width);
+        ImGui::TextUnformatted(plain.c_str());
+        ImGui::PopTextWrapPos();
+      }
+    }
+
+    // Skip opening ``` and language tag (rest of line)
+    size_t code_start = text.find('\n', fence_start + 3);
+    if (code_start == std::string::npos) {
+      break;
+    }
+    ++code_start;  // skip the newline
+
+    // Find closing ```
+    size_t fence_end = text.find("```", code_start);
+    if (fence_end == std::string::npos) {
+      fence_end = text.size();
+    }
+
+    // Extract code content and trim surrounding whitespace
+    std::string code = text.substr(code_start, fence_end - code_start);
+    while (!code.empty() &&
+           (code.back() == '\n' || code.back() == '\r' || code.back() == ' ')) {
+      code.pop_back();
+    }
+    while (!code.empty() && (code.front() == '\n' || code.front() == '\r')) {
+      code.erase(0, 1);
+    }
+
+    if (!code.empty()) {
+      // Code block background
+      ImVec2 cursor = ImGui::GetCursorScreenPos();
+      if (mono_font) {
+        ImGui::PushFont(mono_font);
+      }
+
+      // Calculate block height by counting lines
+      int line_count = 1;
+      for (char c : code) {
+        if (c == '\n') {
+          line_count++;
+        }
+      }
+      float line_height = ImGui::GetTextLineHeight();
+      float block_height = line_height * line_count + 8.0f;
+      float block_width = max_width;
+
+      // Draw background
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      dl->AddRectFilled(ImVec2(cursor.x, cursor.y),
+                        ImVec2(cursor.x + block_width, cursor.y + block_height),
+                        IM_COL32(30, 30, 35, 200), 4.0f);
+
+      ImGui::SetCursorScreenPos(ImVec2(cursor.x + 4.0f, cursor.y + 4.0f));
+
+      // Render each line with syntax highlighting
+      const char* src = code.c_str();
+      const char* end = src + code.size();
+      while (src < end) {
+        const char* line_end = src;
+        while (line_end < end && *line_end != '\n') {
+          ++line_end;
+        }
+        RenderCodeLine(src, line_end);
+        src = line_end < end ? line_end + 1 : end;
+      }
+
+      if (mono_font) {
+        ImGui::PopFont();
+      }
+
+      // Move cursor past the block
+      ImGui::SetCursorScreenPos(
+          ImVec2(cursor.x, cursor.y + block_height + 4.0f));
+      ImGui::Dummy(ImVec2(block_width, 0));
+    }
+
+    // Skip past closing ```
+    pos = fence_end + 3;
+    // Skip trailing newline after closing fence
+    if (pos < text.size() && text[pos] == '\n') {
+      ++pos;
+    }
+}
+
 void TextEditor::HandleKeyboardInputs()
 {
 	ImGuiIO& io = ImGui::GetIO();
@@ -948,10 +1136,14 @@ void TextEditor::HandleMouseInputs()
 void TextEditor::Render()
 {
 	/* Compute mCharAdvance regarding to scaled font size (Ctrl + mouse wheel)*/
-	const float fontSize = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, "#", nullptr, nullptr).x;
-	mCharAdvance = ImVec2(fontSize, ImGui::GetTextLineHeightWithSpacing() * mLineSpacing);
+  const float fontSize = ImGui::GetFont()
+                             ->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX,
+                                             -1.0f, "#", nullptr, nullptr)
+                             .x;
+  mCharAdvance =
+      ImVec2(fontSize, ImGui::GetTextLineHeightWithSpacing() * mLineSpacing);
 
-	/* Update palette with the current alpha from style */
+  /* Update palette with the current alpha from style */
 	for (int i = 0; i < (int)PaletteIndex::Max; ++i)
 	{
 		auto color = ImGui::ColorConvertU32ToFloat4(mPaletteBase[i]);
@@ -972,6 +1164,7 @@ void TextEditor::Render()
 	}
 
 	ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
+	mContentOrigin = cursorScreenPos;
 	auto scrollX = ImGui::GetScrollX();
 	auto scrollY = ImGui::GetScrollY();
 
@@ -1144,30 +1337,29 @@ void TextEditor::Render()
 						drawList->AddLine(p2, p4, 0x90909090);
 					}
 				}
-				else if (glyph.mChar == ' ')
-				{
-					if (mShowWhitespaces)
-					{
-						const auto s = ImGui::GetFontSize();
-						const auto x = textScreenPos.x + bufferOffset.x + spaceSize * 0.5f;
+				else if (glyph.mChar == ' ') {
+                  if (mShowWhitespaces) {
+                    const auto s = ImGui::GetFontSize();
+                    const auto x =
+                        textScreenPos.x + bufferOffset.x + spaceSize * 0.5f;
 						const auto y = textScreenPos.y + bufferOffset.y + s * 0.5f;
-						drawList->AddCircleFilled(ImVec2(x, y), 1.5f, 0x80808080, 4);
-					}
-					bufferOffset.x += spaceSize;
-					i++;
-				}
-				else
+                    drawList->AddCircleFilled(ImVec2(x, y), 1.5f, 0x80808080,
+                                              4);
+                  }
+                  bufferOffset.x += spaceSize;
+                  i++;
+                } else
 				{
 					auto l = UTF8CharLength(glyph.mChar);
-					while (l-- > 0)
-						mLineBuffer.push_back(line[i++].mChar);
-				}
-				++columnNo;
-			}
+                  while (l-- > 0) {
+                    mLineBuffer.push_back(line[i++].mChar);
+                  }
+                }
+                ++columnNo;
+            }
 
-			if (!mLineBuffer.empty())
-			{
-				const ImVec2 newOffset(textScreenPos.x + bufferOffset.x, textScreenPos.y + bufferOffset.y);
+            if (!mLineBuffer.empty()) {
+              const ImVec2 newOffset(textScreenPos.x + bufferOffset.x, textScreenPos.y + bufferOffset.y);
 				drawList->AddText(newOffset, prevColor, mLineBuffer.c_str());
 				mLineBuffer.clear();
 			}
@@ -1176,13 +1368,15 @@ void TextEditor::Render()
 		}
 
 		// Draw a tooltip on known identifiers/preprocessor symbols
+		// (only if the declaration string is non-empty; LSP hover handles the rest)
 		if (ImGui::IsMousePosValid())
 		{
 			auto id = GetWordAt(ScreenPosToCoordinates(ImGui::GetMousePos()));
 			if (!id.empty())
 			{
 				auto it = mLanguageDefinition.mIdentifiers.find(id);
-				if (it != mLanguageDefinition.mIdentifiers.end())
+				if (it != mLanguageDefinition.mIdentifiers.end() &&
+				    !it->second.mDeclaration.empty())
 				{
 					ImGui::BeginTooltip();
 					ImGui::TextUnformatted(it->second.mDeclaration.c_str());
@@ -1191,7 +1385,8 @@ void TextEditor::Render()
 				else
 				{
 					auto pi = mLanguageDefinition.mPreprocIdentifiers.find(id);
-					if (pi != mLanguageDefinition.mPreprocIdentifiers.end())
+					if (pi != mLanguageDefinition.mPreprocIdentifiers.end() &&
+					    !pi->second.mDeclaration.empty())
 					{
 						ImGui::BeginTooltip();
 						ImGui::TextUnformatted(pi->second.mDeclaration.c_str());
