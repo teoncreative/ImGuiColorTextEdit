@@ -821,7 +821,7 @@ void TextEditor::RenderMarkdown(const std::string& text, ImFont* mono_font,
     while (!code.empty() &&
            (code.back() == '\n' || code.back() == '\r' || code.back() == ' ')) {
       code.pop_back();
-           }
+    }
     while (!code.empty() && (code.front() == '\n' || code.front() == '\r')) {
       code.erase(0, 1);
     }
